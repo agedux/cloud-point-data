@@ -36,7 +36,7 @@ def add_defects(pcd, noise_level_percentage, num_holes=5):
         points[noisy_indices_gaussian] += noise
 
     # 添加完全隨機的「離群點」
-    num_random_outliers = int(num_points_clean * (noise_level_percentage / 200.0))
+    num_random_outliers = int(num_points_clean * (noise_level_percentage / 100.0 / 2.0))
     if num_random_outliers > 0:
         min_bound = pcd.get_min_bound()
         max_bound = pcd.get_max_bound()
@@ -53,45 +53,55 @@ def add_defects(pcd, noise_level_percentage, num_holes=5):
     noisy_pcd.points = o3d.utility.Vector3dVector(points)
 
     # --- 步驟 2: 製造孔洞 ---
-    if num_holes > 0:
+    if num_holes > 0 and len(np.asarray(noisy_pcd.points)) > 0:
+        points_for_holes = np.asarray(noisy_pcd.points)
+        all_indices_to_remove = []
+        
+        # 使用點雲的邊界框對角線長度來標準化孔洞半徑
+        bbox_min, bbox_max = noisy_pcd.get_min_bound(), noisy_pcd.get_max_bound()
+        diag_length = np.linalg.norm(bbox_max - bbox_min)
+        # 半徑比例，可根據需求調整
+        radius_ratio = (noise_level_percentage / 100.0) * 0.2 
+        hole_radius = diag_length * radius_ratio
+        # 侵蝕因子，值越小，孔洞越明顯
+        erosion_factor = 0.35
+
         for _ in range(num_holes):
-            # 隨機選擇一個點作為孔洞中心
-            hole_center_index = np.random.randint(0, len(np.asarray(noisy_pcd.points)))
-            hole_center = np.asarray(noisy_pcd.points)[hole_center_index]
-            # 根據噪點強度定義孔洞半徑
-            hole_radius = noise_magnitude * 3.0 
-            pcd_tree = o3d.geometry.KDTreeFlann(noisy_pcd)
-            # 搜尋孔洞半徑內的所有點
-            [_, points_to_remove_indices, _] = pcd_tree.search_radius_vector_3d(hole_center, hole_radius)
+            if len(points_for_holes) == 0: break
+            # 隨機選取一個點作為孔洞中心
+            hole_center = points_for_holes[np.random.randint(0, len(points_for_holes))]
             
-            # 創建一個遮罩，標記要被移除的點
-            points_to_keep_mask = np.ones(len(noisy_pcd.points), dtype=bool)
-            points_to_keep_mask[list(points_to_remove_indices)] = False
-            # 根據遮罩選取要保留的點，從而移除孔洞區域的點
-            noisy_pcd = noisy_pcd.select_by_index(np.where(points_to_keep_mask)[0])
+            # 計算所有點到中心的距離
+            distances = np.linalg.norm(points_for_holes - hole_center, axis=1)
+            
+            # 找到半徑內的所有點
+            indices_in_radius = np.where(distances < hole_radius)[0]
+            if len(indices_in_radius) < 10: # 如果區域內點太少，就跳過，避免產生微小孔洞
+                continue
 
+            # 從半徑內的點中，隨機保留一部分 (侵蝕效果)
+            num_keep = max(1, int(len(indices_in_radius) * erosion_factor))
+            keep_indices = np.random.choice(indices_in_radius, num_keep, replace=False)
+            
+            # 確定最終要移除的點 (半徑內的點 減去 要保留的點)
+            final_remove_indices = np.setdiff1d(indices_in_radius, keep_indices)
+            all_indices_to_remove.extend(final_remove_indices)
+
+        # 從點雲中刪除所有被標記為移除的點
+        unique_indices_to_remove = np.unique(all_indices_to_remove)
+        
+        # 創建一個遮罩，標記要被移除的點
+        points_to_keep_mask = np.ones(len(points_for_holes), dtype=bool)
+        points_to_keep_mask[unique_indices_to_remove] = False
+        
+        # 根據遮罩選取要保留的點，從而移除孔洞區域的點
+        noisy_pcd = noisy_pcd.select_by_index(np.where(points_to_keep_mask)[0])
+    
     return noisy_pcd, ground_truth_noise_indices
-
-def calculate_chamfer_distance(pcd1, pcd2):
-    """
-    計算並印出兩個點雲之間的對稱倒角距離 (Symmetric Chamfer Distance)。
-    此指標用於評估兩個點雲的相似度，值越小代表越相似。
-    """
-    # 計算 pcd1 中每個點到 pcd2 的最近距離
-    dist_pcd1_to_pcd2 = pcd1.compute_point_cloud_distance(pcd2)
-    # 計算 pcd2 中每個點到 pcd1 的最近距離
-    dist_pcd2_to_pcd1 = pcd2.compute_point_cloud_distance(pcd1)
-    
-    # 將兩個方向的平均距離相加，得到對稱倒角距離
-    chamfer_dist = np.mean(dist_pcd1_to_pcd2) + np.mean(dist_pcd2_to_pcd1)
-    
-    print("--- 品質評估 (相似度) ---")
-    print(f"    與乾淨點雲的倒角距離: {chamfer_dist:.4f}")
-    print("------------------------------------")
 
 def calculate_denoising_metrics(total_points_in_noisy_pcd, ground_truth_noise_indices, denoised_inlier_indices):
     """
-    根據參考文件的定義，計算並印出去噪演算法的性能指標 (Precision, Recall, F1-score)。
+    計算並印出去噪演算法的性能指標 (Precision, Recall, F1-score)。
 
     Args:
         total_points_in_noisy_pcd (int): 帶噪點雲的總點數。
@@ -123,7 +133,7 @@ def calculate_denoising_metrics(total_points_in_noisy_pcd, ground_truth_noise_in
     # F1-Score: 精確率和召回率的調和平均數，是綜合評價指標
     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    print("--- 去噪性能指標 (根據參考文件) ---")
+    print("--- 去噪性能指標 ---")
     print(f"    精確率 (Precision, Pd): {precision:.4f}")
     print(f"    召回率 (Recall, Rd):    {recall:.4f}")
     print(f"    F1-score:               {f1_score:.4f}")
@@ -147,7 +157,7 @@ def _get_octree_density_map(pcd, octree_max_depth):
         # 找到點所在的葉節點
         leaf_node, info = octree.locate_leaf_node(point)
         if leaf_node:
-            # 使用葉節點的 (原點, 大小) 作為獨一無二的鍵
+            # 使用葉節點的 (原點, 大小) 作為獨一無無的鍵
             node_key = (info.origin[0], info.origin[1], info.origin[2], info.size)
             if node_key not in leaf_node_key_to_point_indices:
                 leaf_node_key_to_point_indices[node_key] = []
@@ -167,7 +177,7 @@ def _get_octree_density_map(pcd, octree_max_depth):
 
 def remove_outliers(pcd, octree_max_depth=8, k=10, threshold_multiplier=1.0):
     """
-    移除離群點。此函式實現了參考文件中結合「八叉樹密度」與「統計分析」的演算法。
+    移除離群點。結合「八叉樹密度」與「統計分析」的演算法。
     """
     if len(pcd.points) < k + 1:
         return pcd, np.arange(len(pcd.points))
@@ -188,7 +198,7 @@ def remove_outliers(pcd, octree_max_depth=8, k=10, threshold_multiplier=1.0):
         
         density = point_densities[i]
         
-        # 步驟 3: 根據參考文件公式計算離群機率 delta
+        # 步驟 3: 計算離群機率 delta
         # delta = 平均鄰居距離 / 局部密度
         if density > 0:
             deltas[i] = avg_distance / density
@@ -208,7 +218,7 @@ def remove_outliers(pcd, octree_max_depth=8, k=10, threshold_multiplier=1.0):
 
 def remove_confounding_points(pcd, k=20):
     """
-    移除混淆點 (平滑化)。此函式實現了參考文件中「局部平面擬合與投影」的演算法。
+    移除混淆點 (平滑化)。「局部平面擬合與投影」。
     """
     if len(pcd.points) < k:
         return pcd
@@ -241,161 +251,39 @@ def remove_confounding_points(pcd, k=20):
     pcd_projected.points = o3d.utility.Vector3dVector(new_points)
     return pcd_projected
 
-def fill_holes_local_adaptive_alpha(pcd, base_scale=2.0, local_factor=6.0):
-    """[孔洞填補方法A] 使用自適應 Alpha-shape 演算法進行重建。"""
-    points = np.asarray(pcd.points)
-    if len(points) < 3:
-        return pcd
-
-    # 根據局部點密度計算自適應的 alpha 值
-    tree = cKDTree(points)
-    dists, _ = tree.query(points, k=8)
-    local_mean = np.mean(dists[:, 1:], axis=1)
-    global_avg = np.mean(local_mean)
-
-    alpha = np.clip(np.max(local_mean) * base_scale,
-                    global_avg * 0.5,
-                    global_avg * local_factor)
-    print(f"[Alpha-fill] 使用自適應 alpha = {alpha:.5f}")
-
-    # 從點雲創建 Alpha-shape 三角網格
-    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.compute_vertex_normals()
-    # 從生成的網格上均勻採樣，得到填補孔洞後的點雲
-    return mesh.sample_points_uniformly(len(points))
-
-def fill_holes_poisson_enhanced(pcd, depth=8):
-    """[孔洞填補方法B] 使用增強的泊松表面重建 (Poisson Surface Reconstruction)。"""
-    # 估計並對齊法向量，這是泊松重建的關鍵前置步驟
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
-    pcd.orient_normals_consistent_tangent_plane(20)
+def fill_holes_bpa(pcd):
+    """
+    [最終方法] 使用滾球算法 (Ball-Pivoting Algorithm, BPA) 填補孔洞。
+    BPA 對於處理帶有精細細節和孔洞的點雲通常比 Alpha-shape 和泊松重建更穩健。
+    """
+    print("  正在使用滾球算法 (BPA) 進行網格重建...")
     
-    # 從點雲創建泊松網格
-    mesh_poisson, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+    # 強制重新計算並統一法線方向，這是解決光照問題的關鍵
+    pcd.estimate_normals()
+    camera_location = pcd.get_max_bound() + np.array([0, 0, np.linalg.norm(pcd.get_max_bound() - pcd.get_min_bound())])
+    pcd.orient_normals_towards_camera_location(camera_location)
 
-    # 對生成的網格進行裁剪，以去除邊界外的多餘部分
-    bbox = pcd.get_axis_aligned_bounding_box()
-    bbox = bbox.scale(1.01, bbox.get_center())
-    mesh_crop = mesh_poisson.crop(bbox)
-    mesh_crop.remove_degenerate_triangles()
-    mesh_crop.remove_duplicated_vertices()
-    mesh_crop.compute_vertex_normals()
-    # 從最終的網格上均勻採樣，得到點雲
-    return mesh_crop.sample_points_uniformly(len(np.asarray(pcd.points)))
-
-def fill_holes_combined(pcd):
-    """
-    [當前使用的孔洞填補方法] 結合 Alpha-shape 和泊松重建的優點。
-    """
-    print("執行 Alpha-shape 重建...")
-    pcd_alpha = fill_holes_local_adaptive_alpha(pcd)
-    print("執行泊松表面重建...")
-    pcd_poisson = fill_holes_poisson_enhanced(pcd)
-
-    # 裁剪泊松重建的結果，使其範圍與 Alpha-shape 的結果大致相同
-    bbox_alpha = pcd_alpha.get_axis_aligned_bounding_box()
-    pcd_poisson_cropped = pcd_poisson.crop(bbox_alpha)
-
-    print("結合 Alpha-shape 和泊松重建的結果...")
-    combined_points = np.vstack((np.asarray(pcd_alpha.points),
-                                 np.asarray(pcd_poisson_cropped.points)))
-    pcd_combined = o3d.geometry.PointCloud()
-    pcd_combined.points = o3d.utility.Vector3dVector(combined_points)
-    # 使用體素下採樣來合併重複的點並均化密度
-    pcd_combined = pcd_combined.voxel_down_sample(voxel_size=0.001)
-    return pcd_combined
-
-
-def fill_holes(pcd, alpha_multiplier=4.0, max_area_threshold_factor=3.0, points_per_iteration=50):
-    """
-    [未被使用的孔洞填補方法] 實現參考文件中描述的「基於優先級的迭代填補」演算法。
-    """
-    pcd_filled = o3d.geometry.PointCloud(pcd)
-    # 計算平均點距，用於設定 alpha 值
-    avg_dist = np.mean(pcd_filled.compute_nearest_neighbor_distance())
-    if avg_dist == 0:
-        print("    平均點距為零，無法填補孔洞。")
+    # 計算滾動球體的半徑。這一步是關鍵。
+    # 我們提供一系列半徑，從較小的值（捕捉細節）到較大的值（跨越孔洞）。
+    avg_dist = np.mean(pcd.compute_nearest_neighbor_distance())
+    radii = [avg_dist, avg_dist * 2, avg_dist * 4, avg_dist * 8]
+    
+    try:
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, o3d.utility.DoubleVector(radii))
+        
+        # 對網格進行一些基礎的清潔
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_unreferenced_vertices()
+        
+        print("  BPA 網格重建完成。正在從網格採樣...")
+        # 從重建的網格上採樣，以獲得均勻的點雲
+        pcd_filled = mesh.sample_points_uniformly(number_of_points=len(pcd.points))
         return pcd_filled
-    alpha = avg_dist * alpha_multiplier
-    max_iterations = 10 # 設定最大迭代次數以防止無限循環
 
-    # 迭代填補孔洞
-    for i in range(max_iterations):
-        print(f"  孔洞填補迭代 {i+1}...")
-        # 步驟 1: 創建 Alpha-shape 三角網格
-        try:
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_filled, alpha)
-            mesh.compute_vertex_normals()
-        except Exception as e:
-            print(f"    無法創建網格: {e}。停止填補。")
-            break
-        
-        triangles = np.asarray(mesh.triangles)
-        vertices = np.asarray(mesh.vertices)
-        if len(triangles) == 0:
-            print("    網格中沒有三角形。停止填補。")
-            break
-
-        # 步驟 2: 計算每個三角形的面積作為優先級
-        triangle_areas = np.zeros(len(triangles))
-        for j, tri_indices in enumerate(triangles):
-            v0, v1, v2 = vertices[tri_indices[0]], vertices[tri_indices[1]], vertices[tri_indices[2]]
-            # 使用向量叉積計算面積
-            triangle_areas[j] = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
-        
-        avg_area = np.mean(triangle_areas)
-        max_area_threshold = avg_area * max_area_threshold_factor
-        # 按面積從大到小排序，面積大的優先處理
-        sorted_triangle_indices = np.argsort(triangle_areas)[::-1]
-        
-        new_centroids = []
-        num_added = 0
-        # 步驟 3: 在面積最大的三角形的重心處插入新點
-        for tri_index in sorted_triangle_indices[:points_per_iteration]:
-            # 如果三角形面積小於閾值，則認為它不是一個需要填補的孔洞
-            if triangle_areas[tri_index] < max_area_threshold:
-                break
-            verts_of_largest_triangle = vertices[triangles[tri_index]]
-            centroid = np.mean(verts_of_largest_triangle, axis=0)
-            new_centroids.append(centroid)
-            num_added += 1
-            
-        if num_added == 0:
-            print("    在此次迭代中未找到需要填補的大孔洞。停止填補。")
-            break
-            
-        current_points = np.asarray(pcd_filled.points)
-        new_points_start_index = len(current_points)
-        pcd_filled.points = o3d.utility.Vector3dVector(np.vstack((current_points, np.array(new_centroids))))
-        print(f"    插入了 {num_added} 個新點。正在精煉其位置...")
-        
-        # 步驟 4: [額外步驟] 對新插入的點進行精煉，使其與周圍曲面更平滑
-        pcd_filled_tree = o3d.geometry.KDTreeFlann(pcd_filled)
-        points_to_refine_indices = range(new_points_start_index, len(pcd_filled.points))
-        updated_points = np.asarray(pcd_filled.points)
-
-        for pt_idx in points_to_refine_indices:
-            point_to_refine = updated_points[pt_idx]
-            # 類似 remove_confounding_points 的方法，將新點投影到局部平面上
-            [_, idx, _] = pcd_filled_tree.search_knn_vector_3d(point_to_refine, 20)
-            neighbors = updated_points[idx]
-            
-            centroid = np.mean(neighbors, axis=0)
-            cov_matrix = np.cov(neighbors.T)
-            if np.isnan(cov_matrix).any() or np.isinf(cov_matrix).any():
-                continue
-            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-            normal = eigenvectors[:, np.argmin(eigenvalues)]
-            
-            projection = point_to_refine - np.dot(point_to_refine - centroid, normal) * normal
-            updated_points[pt_idx] = projection
-        pcd_filled.points = o3d.utility.Vector3dVector(updated_points)
-
-    else:
-        print(f"    已達到最大迭代次數 ({max_iterations})。停止填補。")
-    return pcd_filled
+    except Exception as e:
+        print(f"  BPA 執行失敗: {e}")
+        return pcd
 
 def main():
     # --- 1. 設置與載入資料 ---
@@ -403,31 +291,56 @@ def main():
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    data_name = "bunny" # 用於檔案命名
-
-    # 載入乾淨的 Bunny 點雲
-    try:
-        bunny_mesh = o3d.data.BunnyMesh()
-        pcd_clean = o3d.io.read_point_cloud(bunny_mesh.path)
-    except Exception as e:
-        print(f"無法載入 BunnyMesh: {e}")
-        # 如果載入失敗，則創建一個球體作為替代
+    # --- 載入資料 ---
+    # 請在此處設置要載入的點雲檔案路徑
+    file_path = "rawdata/sphere.ply" 
+    
+    if not os.path.exists(file_path):
+        print(f"錯誤: 檔案 '{file_path}' 不存在。")
+        print("請檢查檔案路徑是否正確。")
+        # 如果檔案不存在，創建一個預設的球體以繼續執行
+        print("將創建一個球體作為替代。")
         mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.1)
         pcd_clean = mesh.sample_points_uniformly(number_of_points=20000)
+        data_name = "sphere_fallback"
+    else:
+        # 從檔名中自動獲取 data_name，用於後續儲存檔案
+        data_name = os.path.splitext(os.path.basename(file_path))[0]
+        print(f"正在從 '{file_path}' 載入檔案...")
+        try:
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            if file_extension == ".obj":
+                print("  偵測到 OBJ 檔案，將其作為網格讀取並提取頂點。")
+                mesh = o3d.io.read_triangle_mesh(file_path)
+                if not mesh.has_vertices():
+                    raise ValueError("OBJ 檔案中沒有頂點。")
+                pcd_clean = o3d.geometry.PointCloud()
+                pcd_clean.points = mesh.vertices
+                # 如果網格有頂點顏色，也一併複製過來
+                if mesh.has_vertex_colors():
+                    pcd_clean.colors = mesh.vertex_colors
+            else:
+                # 預設為讀取點雲格式 (PLY, PCD, XYZ 等)
+                print("  偵測到點雲檔案格式，直接讀取。")
+                pcd_clean = o3d.io.read_point_cloud(file_path)
 
-    # data_name = "armadillo" # 用於檔案命名
-    # # 載入乾淨的 Armadillo 點雲
-    # try:
-    #     armadillo_mesh = o3d.data.ArmadilloMesh()
-    #     pcd_clean = o3d.io.read_point_cloud(armadillo_mesh.path)
-    # except Exception as e:
-    #     print(f"無法載入 ArmadilloMesh: {e}")
-    #     mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.1)
-    #     pcd_clean = mesh.sample_points_uniformly(number_of_points=20000)
+            if not pcd_clean.has_points():
+                # 在檔案格式錯誤或為空時，read_point_cloud/read_triangle_mesh 可能返回一個空物件
+                raise ValueError("檔案格式錯誤、檔案為空，或無法提取點。")
+            
+            print(f"成功載入 {len(pcd_clean.points)} 個點。 সন")
+        except Exception as e:
+            print(f"從 '{file_path}' 載入時發生錯誤: {e}")
+            # 如果載入失敗，創建一個預設的球體以繼續執行
+            print("將創建一個球體作為替代。 সন")
+            mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.1)
+            pcd_clean = mesh.sample_points_uniformly(number_of_points=20000)
+            data_name = "sphere_fallback"
 
     pcd_clean.paint_uniform_color([0.5, 0.5, 0.5]) # 灰色
     print("顯示原始乾淨點雲...")
-    # o3d.visualization.draw_geometries([pcd_clean], window_name="Original Clean Point Cloud")
+    o3d.visualization.draw_geometries([pcd_clean], window_name="Original Clean Point Cloud")
 
     # --- 2. 添加瑕疵 (噪點與孔洞) ---
     noise_levels = [20] # 專注於一個噪點等級進行互動式調參
@@ -438,87 +351,102 @@ def main():
         pcd_clean_copy = o3d.geometry.PointCloud(pcd_clean)
 
         # 呼叫 add_defects 函式生成帶有瑕疵的點雲
-        pcd_noisy, noise_indices = add_defects(pcd_clean_copy, noise_level, num_holes=5)
+        pcd_noisy, noise_indices = add_defects(pcd_clean_copy, noise_level, num_holes=7)
         pcd_noisy.paint_uniform_color([1, 0, 0]) # 紅色
         print(f"  添加瑕疵後的點數: {len(pcd_noisy.points)} (包含 {len(noise_indices)} 個噪點)")
         
-        # 儲存帶噪點的點雲
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = os.path.join(output_dir, f"{data_name}_noisy_{timestamp}.ply")
-        o3d.io.write_point_cloud(filename, pcd_noisy)
-        print(f"  已儲存: {filename}")
-        
-        # o3d.visualization.draw_geometries([pcd_noisy], window_name=f"{noise_level}% Noisy Point Cloud")
+        o3d.visualization.draw_geometries([pcd_noisy], window_name=f"{noise_level}% Noisy Point Cloud")
         
         # --- 3. 執行點雲優化流程 ---
         
         # --- 步驟 3.1: 移除離群點 ---
         print("1. 正在移除離群點...")
-        # 可調整參數: octree_max_depth, k, threshold_multiplier
         pcd_outliers_removed, inlier_indices_denoised = remove_outliers(pcd_noisy, octree_max_depth=10, k=15, threshold_multiplier=0.5)
         
-        # 立刻計算去噪性能指標
         calculate_denoising_metrics(len(pcd_noisy.points), noise_indices, inlier_indices_denoised)
         pcd_outliers_removed.paint_uniform_color([0, 1, 0]) # 綠色
         
-        # 儲存移除離群點後的點雲
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(output_dir, f"{data_name}_outliers_removed_{timestamp}.ply")
         o3d.io.write_point_cloud(filename, pcd_outliers_removed)
         print(f"  已儲存: {filename}")
 
-        # o3d.visualization.draw_geometries([pcd_outliers_removed], window_name="1. Outliers Removed")
-
         # --- 步驟 3.2: 移除混淆點 (表面平滑化) ---
         print("2. 正在移除混淆點 (局部平面投影)...")
         pcd_smoothed = pcd_outliers_removed
-        smoothing_iterations = 3 # 執行多輪平滑以獲得更好效果
-        smoothing_k = 30 # 平滑時考慮的鄰居數量
+        smoothing_iterations = 3 
+        smoothing_k = 30 
         for i in range(smoothing_iterations):
             print(f"  平滑化迭代 {i+1}/{smoothing_iterations}...")
-            pcd_confounding_removed = remove_confounding_points(pcd_smoothed, k=smoothing_k)
+            pcd_smoothed = remove_confounding_points(pcd_smoothed, k=smoothing_k)
 
-        pcd_confounding_removed.paint_uniform_color([0, 0, 1]) # 藍色
-        print(f"  所有平滑步驟後的點數: {len(pcd_confounding_removed.points)}")
+        pcd_smoothed.paint_uniform_color([0, 0, 1]) # 藍色
+        print(f"  所有平滑步驟後的點數: {len(pcd_smoothed.points)}")
 
-        # 儲存移除混淆點後的點雲
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(output_dir, f"{data_name}_confounding_removed_{timestamp}.ply")
-        o3d.io.write_point_cloud(filename, pcd_confounding_removed)
+        o3d.io.write_point_cloud(filename, pcd_smoothed)
         print(f"  已儲存: {filename}")
 
-        o3d.visualization.draw_geometries([pcd_confounding_removed], window_name="2. Confounding Points Removed")
+        o3d.visualization.draw_geometries([pcd_smoothed], window_name="2. Confounding Points Removed")
 
-        # --- 步驟 3.3: 填補孔洞 ---
-        print("3. 正在填補孔洞 (使用 Alpha-shape + 泊松重建)...")
-        pcd_holes_filled = fill_holes_combined(pcd_confounding_removed)
+        # --- 步驟 3.3: 填補孔洞 (使用BPA) ---
+        print("3. 正在填補孔洞 (使用滾球算法 BPA)...")
+        pcd_holes_filled = fill_holes_bpa(pcd_smoothed)
         pcd_holes_filled.paint_uniform_color([1, 1, 0]) # 黃色
         print(f"  填補孔洞後的點數: {len(pcd_holes_filled.points)}")
 
-        # 儲存填補孔洞後的點雲
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(output_dir, f"{data_name}_holes_filled_{timestamp}.ply")
         o3d.io.write_point_cloud(filename, pcd_holes_filled)
         print(f"  已儲存: {filename}")
 
-        o3d.visualization.draw_geometries([pcd_holes_filled], window_name="3. Holes Filled")
+        o3d.visualization.draw_geometries([pcd_holes_filled], window_name="3. Holes Filled (BPA)")
 
-        # --- 4. 最終評估與視覺化比較 ---
-        print(f"\n--- {noise_level}% 噪點等級的最終評估 ---")
-        # 注意：此處評估的是填補孔洞前的點雲與乾淨點雲的相似度
-        calculate_chamfer_distance(pcd_confounding_removed, pcd_clean_copy)
-
-        print(f"顯示 {noise_level}% 噪點等級的最終比較:")
-        pcd_clean_copy.paint_uniform_color([0.5, 0.5, 0.5]) # 原始: 灰色
-        pcd_noisy.paint_uniform_color([1, 0, 0]) # 帶瑕疵: 紅色
-        pcd_holes_filled.paint_uniform_color([0, 1, 0]) # 最終結果: 綠色
+        # --- 步驟 3.4: 手動確認並執行後處理清潔 ---
+        print("\n--- 手動確認 ---")
+        user_input = input("孔洞填補已完成。是否要執行最後的清潔步驟 (移除噪點與平滑化)？ (Y/n): ").lower().strip()
         
-        # 為了方便並排比較，將點雲在 x 軸上平移
-        pcd_noisy.translate((0.2, 0, 0))
-        pcd_holes_filled.translate((0.4, 0, 0))
+        pcd_final = pcd_holes_filled 
 
-        o3d.visualization.draw_geometries([pcd_clean_copy, pcd_noisy, pcd_holes_filled],
-                                          window_name=f"最終比較 (由左至右): 乾淨, 帶瑕疵, 處理後")
+        if user_input != 'n':
+            print("\n4. 正在對孔洞填補結果進行最後的清潔...")
+            pcd_cleaned, _ = remove_outliers(pcd_holes_filled, octree_max_depth=8, k=20, threshold_multiplier=1.0)
+            
+            pcd_final_smoothed = pcd_cleaned
+            smoothing_iterations = 3
+            smoothing_k = 30
+            for i in range(smoothing_iterations):
+                print(f"  平滑化迭代 {i+1}/{smoothing_iterations}...")
+                pcd_final_smoothed = remove_confounding_points(pcd_final_smoothed, k=smoothing_k)
+            
+            pcd_final = pcd_final_smoothed
+            pcd_final.paint_uniform_color([0, 1, 1]) # 清潔後使用青色
+            print(f"  清潔後的點數: {len(pcd_final.points)}")
+        else:
+            print("已跳過最後清潔步驟。")
+            pcd_final.paint_uniform_color([1, 1, 0]) # 維持孔洞填補後的黃色
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = os.path.join(output_dir, f"{data_name}_final_{timestamp}.ply")
+        o3d.io.write_point_cloud(filename, pcd_final)
+        print(f"  已儲存最終結果: {filename}")
+
+        print("\n顯示最終結果...")
+        o3d.visualization.draw_geometries([pcd_final], window_name="4. Final Result")
+
+        # # --- 5. 最終視覺化比較 ---
+        # print(f"\n顯示 {noise_level}% 噪點等級的最終比較:")
+        # pcd_clean_copy.paint_uniform_color([0.5, 0.5, 0.5]) # 原始: 灰色
+        # pcd_noisy.paint_uniform_color([1, 0, 0]) # 帶瑕疵: 紅色
+        # pcd_final.paint_uniform_color([0, 1, 0]) # 最終結果: 綠色
+        
+        # # 為了方便並排比較，將點雲在 x 軸上平移
+        # pcd_noisy.translate((0.2, 0, 0))
+        # pcd_final.translate((0.4, 0, 0))
+
+        # o3d.visualization.draw_geometries([pcd_clean_copy, pcd_noisy, pcd_final],
+        #                                   window_name=f"最終比較 (由左至右): 乾淨, 帶瑕疵, 處理後")
 
 if __name__ == "__main__":
     main()
